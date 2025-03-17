@@ -2,6 +2,54 @@
   "identity": {
     "file_name": "identity.json"
   },
+  "climb_images": {
+    "file_name": "geom_train_images.jsonl",
+    "columns": {
+      "query": "problem",
+      "response": "answer",
+      "images": "images"
+    }
+  },
+  "climb_videos": {
+    "file_name": "geom_train_videos.jsonl",
+    "columns": {
+      "query": "problem",
+      "response": "answer",
+      "videos": "videos"
+    }
+  },
+  "climb_valid_images": {
+    "file_name": "geom_valid_images.jsonl",
+    "columns": {
+      "query": "problem",
+      "response": "answer",
+      "images": "images"
+    }
+  },
+  "climb_valid_videos": {
+    "file_name": "geom_valid_videos.jsonl",
+    "columns": {
+      "query": "problem",
+      "response": "answer",
+      "videos": "videos"
+    }
+  },
+  "climb_valid_mini_images": {
+    "file_name": "geom_valid_mini_images.jsonl",
+    "columns": {
+      "query": "problem",
+      "response": "answer",
+      "images": "images"
+    }
+  },
+  "climb_valid_mini_videos": {
+    "file_name": "geom_valid_mini_videos.jsonl",
+    "columns": {
+      "query": "problem",
+      "response": "answer",
+      "videos": "videos"
+    }
+  },
   "alpaca_en_demo": {
     "file_name": "alpaca_en_demo.json"
   },

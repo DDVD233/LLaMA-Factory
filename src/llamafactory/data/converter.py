@@ -85,9 +85,9 @@ class AlpacaDatasetConverter(DatasetConverter):
             else:
                 response = [{"role": Role.ASSISTANT.value, "content": ""}] + response
         elif (
-            self.dataset_attr.ranking
-            and isinstance(example[self.dataset_attr.chosen], str)
-            and isinstance(example[self.dataset_attr.rejected], str)
+                self.dataset_attr.ranking
+                and isinstance(example[self.dataset_attr.chosen], str)
+                and isinstance(example[self.dataset_attr.rejected], str)
         ):  # pairwise example
             response = [
                 {"role": Role.ASSISTANT.value, "content": example[self.dataset_attr.chosen]},
@@ -98,14 +98,31 @@ class AlpacaDatasetConverter(DatasetConverter):
         else:  # unsupervised
             response = []
 
+        # Extract and store images/videos for later data source classification
+        images = self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None
+        videos = self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None
+
+        # Store original paths for data source extraction
+        original_image_paths = example.get(self.dataset_attr.images, None) if self.dataset_attr.images else None
+        original_video_paths = example.get(self.dataset_attr.videos, None) if self.dataset_attr.videos else None
+
+        # If not in a list format, convert to list
+        if original_image_paths and not isinstance(original_image_paths, list):
+            original_image_paths = [original_image_paths]
+        if original_video_paths and not isinstance(original_video_paths, list):
+            original_video_paths = [original_video_paths]
+
         output = {
             "_prompt": prompt,
             "_response": response,
             "_system": example[self.dataset_attr.system] if self.dataset_attr.system else "",
             "_tools": example[self.dataset_attr.tools] if self.dataset_attr.tools else "",
-            "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
-            "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
+            "_images": images,
+            "_videos": videos,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            # Store the original paths
+            "_original_image_paths": original_image_paths,
+            "_original_video_paths": original_video_paths,
         }
         return output
 

@@ -1111,26 +1111,61 @@ class Qwen2VLPlugin(BasePlugin):
 
     @override
     def _regularize_videos(
-        self, videos: list["VideoInput"], **kwargs
+            self, videos: list["VideoInput"], **kwargs
     ) -> tuple[list[list["ImageObject"]], list[float]]:
         results, fps_per_video = [], []
         for video in videos:
-            container = av.open(video, "r")
-            video_stream = next(stream for stream in container.streams if stream.type == "video")
-            sample_indices = self._get_video_sample_indices(video_stream, **kwargs)
-            frames: list[ImageObject] = []
-            container.seek(0)
-            for frame_idx, frame in enumerate(container.decode(video_stream)):
-                if frame_idx in sample_indices:
-                    frames.append(frame.to_image())
+            try:
+                container = av.open(video, "r")
+                video_stream = next((stream for stream in container.streams if stream.type == "video"), None)
 
-            if len(frames) % 2 != 0:  # qwen2-vl requires even number of frames
-                frames.append(frames[-1])
+                if video_stream is None:
+                    # Handle case where no video stream is found
+                    raise ValueError("No video stream found in the file")
 
-            frames = self._regularize_images(frames, **kwargs)
+                sample_indices = self._get_video_sample_indices(video_stream, **kwargs)
+                frames: list[ImageObject] = []
+                container.seek(0)
+
+                for frame_idx, frame in enumerate(container.decode(video_stream)):
+                    if frame_idx in sample_indices:
+                        frames.append(frame.to_image())
+
+                # If we got no frames, raise an exception to trigger the fallback
+                if len(frames) == 0:
+                    raise ValueError("No frames could be decoded from video")
+
+                if len(frames) % 2 != 0:  # qwen2-vl requires even number of frames
+                    frames.append(frames[-1])
+
+                frames = self._regularize_images(frames, **kwargs)
+
+            except Exception as e:
+                # Create a placeholder video with white frames
+                # Use default values or get them from kwargs
+                video_fps = kwargs.get("video_fps", 2.0)
+                video_maxlen = kwargs.get("video_maxlen", 8)  # Using smaller default for placeholder
+                width = 256
+                height = 256
+
+                # Create white frames
+                frames = []
+                for _ in range(video_maxlen):
+                    # Create a white image with PIL
+                    white_frame = Image.new('RGB', (width, height), color='white')
+                    frames.append(white_frame)
+
+                # Make sure we have an even number of frames
+                if len(frames) % 2 != 0:
+                    frames.append(frames[-1])
+
+                # Log the error
+                print(f"Error processing video, using white placeholder: {str(e)}")
+
             results.append(frames)
-            if video_stream.duration is None:
-                fps_per_video.append(2.0)
+            # Use default FPS for placeholder or actual FPS for valid videos
+            if 'video_stream' not in locals() or video_stream.duration is None:
+                fps_per_video.append(kwargs.get("video_fps", 2.0))
             else:
                 fps_per_video.append(len(sample_indices) / float(video_stream.duration * video_stream.time_base))
 
