@@ -203,20 +203,24 @@ class MMPluginMixin:
         r"""Regularize images to avoid error. Including reading and pre-processing."""
         results = []
         for image in images:
-            if isinstance(image, str):
-                image = Image.open(image)
-            elif isinstance(image, bytes):
-                image = Image.open(BytesIO(image))
-            elif isinstance(image, dict):
-                if image["bytes"] is not None:
-                    image = Image.open(BytesIO(image["bytes"]))
-                else:
-                    image = Image.open(image["path"])
+            try:
+                if isinstance(image, str):
+                    image = Image.open(image)
+                elif isinstance(image, bytes):
+                    image = Image.open(BytesIO(image))
+                elif isinstance(image, dict):
+                    if image["bytes"] is not None:
+                        image = Image.open(BytesIO(image["bytes"]))
+                    else:
+                        image = Image.open(image["path"])
 
-            if not isinstance(image, ImageObject):
-                raise ValueError(f"Expect input is a list of images, but got {type(image)}.")
+                if not isinstance(image, ImageObject):
+                    raise ValueError(f"Expect input is a list of images, but got {type(image)}.")
 
-            results.append(self._preprocess_image(image, **kwargs))
+                results.append(self._preprocess_image(image, **kwargs))
+            except Exception as e:
+                # use placeholder image if error occurs
+                results.append(Image.new("RGB", (224, 224), (255, 255, 255)))
 
         return results
 
@@ -1164,10 +1168,14 @@ class Qwen2VLPlugin(BasePlugin):
 
             results.append(frames)
             # Use default FPS for placeholder or actual FPS for valid videos
-            if 'video_stream' not in locals() or video_stream.duration is None:
+            if 'video_stream' not in locals() or video_stream is None or video_stream.duration is None:
                 fps_per_video.append(kwargs.get("video_fps", 2.0))
             else:
                 fps_per_video.append(len(sample_indices) / float(video_stream.duration * video_stream.time_base))
+            for index, fps in enumerate(fps_per_video):
+                if fps < 0.1:
+                    fps_per_video[index] = 2.0
+
 
         return results, fps_per_video
 

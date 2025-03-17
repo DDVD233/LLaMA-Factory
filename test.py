@@ -6,6 +6,27 @@ if __name__ == '__main__':
         path="json",
         name=None,
         data_dir=None,
-        data_files=['/mnt/8T/high_modality/geom_train_images.jsonl'],
+        data_files=['/scratch/high_modality/geom_train_images.jsonl'],
+        split="train",
+    )
+    dataset = load_dataset(
+        path="json",
+        name=None,
+        data_dir=None,
+        data_files=['/scratch/high_modality/geom_train_videos.jsonl'],
+        split="train",
+    )
+    dataset = load_dataset(
+        path="json",
+        name=None,
+        data_dir=None,
+        data_files=['/scratch/high_modality/geom_valid_images.jsonl'],
+        split="train",
+    )
+    dataset = load_dataset(
+        path="json",
+        name=None,
+        data_dir=None,
+        data_files=['/scratch/high_modality/geom_valid_videos.jsonl'],
         split="train",
     )

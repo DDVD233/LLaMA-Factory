@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
+import wandb
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
@@ -14,6 +15,10 @@ from ...extras.packages import is_transformers_version_greater_than
 from ..callbacks import SaveProcessorCallback
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 from ...extras.compute_metrics import compute_metrics_by_data_source
+
+from datasets import concatenate_datasets
+from transformers.trainer import _is_peft_model, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, has_length
+import tqdm
 
 if TYPE_CHECKING:
     from torch.utils.data import Dataset
@@ -40,6 +45,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         else:
             self.processing_class: PreTrainedTokenizer = kwargs.get("tokenizer")
 
+
+        self.dataset_dir = kwargs.pop("dataset_dir", "/")
+        print(f"dataset_dir: {self.dataset_dir}")
         super().__init__(**kwargs)
         self.finetuning_args = finetuning_args
         if gen_kwargs is not None:
@@ -103,6 +111,62 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return loss, generated_tokens, labels
 
     @override
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+
+        if "paths" in inputs:
+            inputs.pop("paths")
+        if self.model_accepts_loss_kwargs:
+            loss_kwargs = {}
+            if num_items_in_batch is not None:
+                loss_kwargs["num_items_in_batch"] = num_items_in_batch
+            inputs = {**inputs, **loss_kwargs}
+        outputs = model(**inputs)
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            unwrapped_model = self.accelerator.unwrap_model(model)
+            if _is_peft_model(unwrapped_model):
+                model_name = unwrapped_model.base_model.model._get_name()
+            else:
+                model_name = unwrapped_model._get_name()
+            # User-defined compute_loss function
+            if self.compute_loss_func is not None:
+                loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
+            elif model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        if (
+            self.args.average_tokens_across_devices
+            and (self.model_accepts_loss_kwargs or self.compute_loss_func)
+            and num_items_in_batch is not None
+        ):
+            loss *= self.accelerator.num_processes
+
+        return (loss, outputs) if return_outputs else loss
+
+    @override
     def evaluate(
             self,
             eval_dataset: Optional["Dataset"] = None,
@@ -111,18 +175,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             **gen_kwargs,
     ) -> Dict[str, float]:
         """
-        Run evaluation with hierarchical metrics by data source and dataset.
-        Processes the dataset sequentially to ensure correct mapping between
-        predictions and their metadata.
-
-        Args:
-            eval_dataset: The evaluation dataset.
-            ignore_keys: Keys to ignore when gathering predictions.
-            metric_key_prefix: The prefix for metric keys in the returned dictionary.
-            **gen_kwargs: Generation kwargs to pass to model.generate().
-
-        Returns:
-            Dict[str, float]: A dictionary containing the evaluation metrics.
+        Run evaluation with distributed support by using Accelerator's primitives.
         """
         # Set up evaluation dataset
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
@@ -130,182 +183,108 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
         # Create dataloader for evaluation
-        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        if isinstance(eval_dataset, dict):
+            combined_dataset = concatenate_datasets(list(eval_dataset.values()))
+            eval_dataloader = self.get_eval_dataloader(combined_dataset)
+        else:
+            eval_dataloader = self.get_eval_dataloader(eval_dataset)
 
-        # Initialize lists to store predictions, ground truths, and metadata
+        # This is a much simpler approach using the accelerator's gather functionality
+        # Initialize containers for results
         all_preds = []
         all_labels = []
         all_data_sources = []
         all_datasets = []
 
-        # Set model to evaluation mode
+        # Prepare the model
         model = self._wrap_model(self.model, training=False, dataloader=eval_dataloader)
-
-        # Put model on eval mode
         model.eval()
 
-        # If only the model is provided to accelerator.prepare() (not the optimizer, etc),
-        # it may lead to unexpected behaviors (e.g., CPU instead of GPU usage).
-        # We verify if the model is on the correct device.
-        if self.args.device.type != "cuda" and torch.cuda.is_available():
-            self.logger.warning_once(
-                "The model is not on the expected device: "
-                f"({self.args.device.type} vs. cuda). "
-                "It might lead to degraded performance."
-            )
+        # Log info
+        logger.info("\n***** Running evaluation *****")
+        logger.info(f"  Num examples = {self.num_examples(eval_dataloader)}")
+        logger.info(f"  Batch size = {self.args.eval_batch_size}")
 
-        # Initialize metrics
-        metrics = {}
+        # Evaluation loop
+        for step, inputs in enumerate(tqdm.tqdm(eval_dataloader, desc="Evaluation")):
+            # Move inputs to device
+            inputs = self._prepare_inputs(inputs)
 
-        # Process each batch in the dataloader
-        for step, inputs in enumerate(eval_dataloader):
-            # Extract original samples from batch for metadata extraction
-            batch_size = len(inputs["input_ids"]) if isinstance(inputs, dict) else inputs[0].shape[0]
-
-            # Extract data sources and datasets from this batch
+            # Extract metadata
+            batch_size = len(inputs["input_ids"])
             batch_data_sources = []
             batch_datasets = []
 
-            # Process each example in the batch to extract metadata
             for i in range(batch_size):
-                # Get the original example from the dataset
-                example_idx = step * eval_dataloader.batch_size + i
-                if example_idx >= len(eval_dataset):
-                    continue  # Skip if we're beyond the dataset size (last batch might be incomplete)
-
-                example = eval_dataset[example_idx]
-
-                # Extract row_dict from example
-                row_dict = example
-                if isinstance(example, dict) and "json" in example:
-                    try:
-                        row_dict = json.loads(example["json"])
-                    except:
-                        row_dict = example
-
-                # Extract data source and dataset based on the provided logic
-                # First check if we have the original paths (from the enhanced converter)
-                if "_original_image_paths" in row_dict and row_dict["_original_image_paths"] and len(
-                        row_dict["_original_image_paths"]) > 0:
-                    path = row_dict["_original_image_paths"][0]
-                    if isinstance(path, str) and "/" in path:
-                        parts = path.split("/")
-                        if len(parts) >= 2:
-                            data_source = parts[0]
-                            dataset = parts[1]
-                        else:
-                            data_source = "unknown"
-                            dataset = "image"
-                    else:
-                        data_source = "unknown"
-                        dataset = "image"
-                elif "_original_video_paths" in row_dict and row_dict["_original_video_paths"] and len(
-                        row_dict["_original_video_paths"]) > 0:
-                    path = row_dict["_original_video_paths"][0]
-                    if isinstance(path, str) and "/" in path:
-                        parts = path.split("/")
-                        if len(parts) >= 2:
-                            data_source = parts[0]
-                            dataset = parts[1]
-                        else:
-                            data_source = "unknown"
-                            dataset = "video"
-                    else:
-                        data_source = "unknown"
-                        dataset = "video"
-                # Fall back to the processed paths if original paths aren't available
-                elif "_images" in row_dict and row_dict["_images"] is not None and len(row_dict["_images"]) > 0:
-                    image_path = row_dict["_images"][0]
-                    path_parts = image_path.split("/")
-                    # Look for parts that might correspond to data source and dataset
-                    # This is less reliable than using original paths
-                    for i in range(len(path_parts) - 1):
-                        if i + 1 < len(path_parts):
-                            data_source = path_parts[i]
-                            dataset = path_parts[i + 1]
-                            break
-                    else:
-                        data_source = "unknown"
-                        dataset = "image"
-                elif "_videos" in row_dict and row_dict["_videos"] is not None and len(row_dict["_videos"]) > 0:
-                    video_path = row_dict["_videos"][0]
-                    path_parts = video_path.split("/")
-                    # Look for parts that might correspond to data source and dataset
-                    # This is less reliable than using original paths
-                    for i in range(len(path_parts) - 1):
-                        if i + 1 < len(path_parts):
-                            data_source = path_parts[i]
-                            dataset = path_parts[i + 1]
-                            break
-                    else:
-                        data_source = "unknown"
-                        dataset = "video"
+                if "paths" in inputs and inputs["paths"] and len(inputs["paths"]) > 0:
+                    path = inputs['paths'][i][0]
+                    base_path = self.dataset_dir
+                    path = os.path.relpath(path, base_path)
+                    parts = path.split("/")
+                    assert len(parts) >= 2
+                    data_source = parts[0]
+                    dataset = parts[1]
                 else:
-                    data_source = "text"
-                    dataset = "text"
-
-                # Add debugging for the first few examples
-                if example_idx < 5:  # Only log for the first 5 examples to avoid flooding logs
-                    logger.info(f"Example {example_idx}: data_source={data_source}, dataset={dataset}")
-                    if "_images" in row_dict:
-                        logger.info(f"  _images: {row_dict.get('_images')}")
-                    if "_original_image_paths" in row_dict:
-                        logger.info(f"  _original_image_paths: {row_dict.get('_original_image_paths')}")
-                    if "_videos" in row_dict:
-                        logger.info(f"  _videos: {row_dict.get('_videos')}")
-                    if "_original_video_paths" in row_dict:
-                        logger.info(f"  _original_video_paths: {row_dict.get('_original_video_paths')}")
+                    data_source = "unknown"
+                    dataset = "unknown"
 
                 batch_data_sources.append(data_source)
                 batch_datasets.append(dataset)
 
-            # Move inputs to appropriate device
-            for k, v in inputs.items():
-                if isinstance(v, torch.Tensor):
-                    inputs[k] = v.to(model.device)
-
-            # Don't pass labels to model when generating
-            if self.args.predict_with_generate:
-                input_ids = inputs["input_ids"] if "input_ids" in inputs else None
-                labels = inputs.pop("labels") if "labels" in inputs else None
+            # Generate predictions
+            with torch.no_grad():
+                input_ids = inputs["input_ids"]
                 attention_mask = inputs.get("attention_mask", None)
+                labels = inputs.pop("labels") if "labels" in inputs else None
 
-                # Generate predictions
-                with torch.no_grad():
-                    generated_tokens = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        **gen_kwargs
-                    )
+                generated_tokens = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **gen_kwargs
+                )
 
-                    # Process the generated tokens
-                    if generated_tokens is not None:
-                        generated_tokens[:, :input_ids.size(-1)] = self.processing_class.pad_token_id
-                        generated_tokens = generated_tokens.contiguous()
+                # Process generated tokens
+                if generated_tokens is not None:
+                    generated_tokens[:, :input_ids.size(-1)] = self.processing_class.pad_token_id
+                    generated_tokens = generated_tokens.contiguous()
 
-                # Decode predictions and labels
+                # Process labels
                 if labels is not None:
+                    # Convert labels to CPU before numpy conversion
                     labels = labels.cpu().numpy()
                     labels = np.where(
                         labels != IGNORE_INDEX, labels, self.processing_class.pad_token_id
                     )
                     decoded_labels = self.processing_class.batch_decode(labels, skip_special_tokens=True)
-                    all_labels.extend(decoded_labels)
 
+                    # Use accelerator to gather across processes - ensuring we get all labels
+                    gathered_labels = self.accelerator.gather_for_metrics(decoded_labels)
+                    all_labels.extend(gathered_labels)
+
+                # Process predictions
                 if generated_tokens is not None:
+                    # Convert to CPU before numpy conversion
                     generated_tokens = generated_tokens.cpu().numpy()
                     generated_tokens = np.where(
                         generated_tokens != IGNORE_INDEX, generated_tokens, self.processing_class.pad_token_id
                     )
                     decoded_preds = self.processing_class.batch_decode(generated_tokens, skip_special_tokens=True)
-                    all_preds.extend(decoded_preds)
 
-                # Store metadata
-                all_data_sources.extend(batch_data_sources)
-                all_datasets.extend(batch_datasets)
+                    # Use accelerator to gather across processes
+                    gathered_preds = self.accelerator.gather_for_metrics(decoded_preds)
+                    all_preds.extend(gathered_preds)
 
-        # Compute hierarchical metrics using collected predictions and metadata
+                # Gather metadata
+                gathered_sources = self.accelerator.gather_for_metrics(batch_data_sources)
+                gathered_datasets = self.accelerator.gather_for_metrics(batch_datasets)
+
+                all_data_sources.extend(gathered_sources)
+                all_datasets.extend(gathered_datasets)
+
+        # Compute metrics only on the main process after gathering all data
+        metrics = {}
         if len(all_preds) > 0 and len(all_labels) > 0:
+            # Compute hierarchical metrics
             hierarchical_metrics = compute_metrics_by_data_source(
                 predictions=all_preds,
                 ground_truths=all_labels,
@@ -313,16 +292,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 datasets=all_datasets
             )
 
-            # Add hierarchical metrics to the final metrics dictionary
             metrics.update(hierarchical_metrics)
 
             # Log metrics
             self.log(metrics)
-
-            # Save predictions to file for later analysis
             if self.is_world_process_zero():
+                wandb.log(metrics, step=self.state.global_step)
+
+                # Save predictions to file
                 output_prediction_file = os.path.join(self.args.output_dir, "hierarchical_predictions.jsonl")
-                logger.info_rank0(f"Saving hierarchical prediction results to {output_prediction_file}")
+                logger.info(f"Saving hierarchical prediction results to {output_prediction_file}")
 
                 with open(output_prediction_file, "w", encoding="utf-8") as f:
                     for pred, label, source, dataset in zip(all_preds, all_labels, all_data_sources, all_datasets):

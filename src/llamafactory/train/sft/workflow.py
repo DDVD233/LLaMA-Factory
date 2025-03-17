@@ -92,6 +92,7 @@ def run_sft(
         data_collator=data_collator,
         callbacks=callbacks,
         gen_kwargs=gen_kwargs,
+        dataset_dir=data_args.dataset_dir,
         **dataset_module,
         **tokenizer_module,
         **metric_module,
